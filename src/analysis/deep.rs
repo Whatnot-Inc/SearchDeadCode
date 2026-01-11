@@ -146,6 +146,44 @@ impl DeepAnalyzer {
             Self::collect_ancestors(graph, &id, &mut reachable);
         }
 
+        // When a class/type is reachable, follow references from its members (fields, etc.)
+        // This ensures inner classes referenced by field initializers are reachable
+        let reachable_types: Vec<_> = reachable
+            .iter()
+            .filter(|id| {
+                if let Some(decl) = graph.get_declaration(id) {
+                    decl.kind.is_type()
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect();
+
+        for type_id in reachable_types {
+            // Find all members of this type
+            for decl in graph.declarations() {
+                if decl.parent.as_ref() == Some(&type_id) {
+                    // Follow edges from this member
+                    if let Some(member_idx) = graph.node_index(&decl.id) {
+                        for neighbor in inner_graph.neighbors(member_idx) {
+                            if let Some(neighbor_id) = inner_graph.node_weight(neighbor) {
+                                if !reachable.contains(neighbor_id) {
+                                    // DFS from this newly discovered node
+                                    let mut dfs = Dfs::new(inner_graph, neighbor);
+                                    while let Some(node_idx) = dfs.next(inner_graph) {
+                                        if let Some(node_id) = inner_graph.node_weight(node_idx) {
+                                            reachable.insert(node_id.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // IMPORTANT: Only mark certain members as reachable:
         // 1. Override methods (called via polymorphism)
         // 2. Constructors of instantiated classes
@@ -281,20 +319,21 @@ impl DeepAnalyzer {
                 .collect()
         };
 
-        reachable.extend(additional);
-
         // Collect sealed class subtypes and interface implementations
         let sealed_subtypes = self.collect_sealed_subtypes(graph, &reachable);
         let interface_impls = self.collect_interface_implementations(graph, &reachable);
 
-        // Only do incremental DFS from NEWLY added items (not all reachable)
-        let new_items: Vec<_> = sealed_subtypes
+        // Combine all newly discovered items for incremental DFS
+        // This includes: override methods, sealed subtypes, interface implementations
+        let new_items: Vec<_> = additional
             .iter()
+            .chain(sealed_subtypes.iter())
             .chain(interface_impls.iter())
             .filter(|id| !reachable.contains(*id))
             .cloned()
             .collect();
 
+        reachable.extend(additional);
         reachable.extend(sealed_subtypes);
         reachable.extend(interface_impls);
 
@@ -695,6 +734,13 @@ impl DeepAnalyzer {
             return true;
         }
 
+        // Skip parameters - let the dedicated UnusedParamDetector handle them
+        // The detector checks if parameters are actually used in their function body,
+        // which is more accurate than reachability-based detection
+        if decl.kind == DeclarationKind::Parameter {
+            return true;
+        }
+
         // Skip members of unreachable classes (report class instead)
         if let Some(parent_id) = &decl.parent {
             if !reachable.contains(parent_id) {
@@ -722,6 +768,15 @@ impl DeepAnalyzer {
 
         // Skip data class auto-generated methods (copy, componentN, equals, hashCode, toString)
         if self.is_data_class_generated_method(decl, graph) {
+            return true;
+        }
+
+        // Skip overridden methods (they might be called via interface/base class)
+        // Check both Java-style @Override annotation and Kotlin override modifier
+        if decl.annotations.iter().any(|a| a.contains("Override")) {
+            return true;
+        }
+        if decl.modifiers.iter().any(|m| m == "override") {
             return true;
         }
 

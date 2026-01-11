@@ -511,6 +511,9 @@ impl JavaParser {
         parent: Option<DeclarationId>,
         result: &mut ParseResult,
     ) -> Result<()> {
+        // Extract the type from field_declaration (shared by all declarators)
+        let field_type = self.extract_field_type(node, source);
+
         // Field declaration can have multiple declarators
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -542,6 +545,7 @@ impl JavaParser {
                     self.extract_modifiers(node, source, &mut decl);
                     decl.annotations = self.extract_annotations(node, source);
                     decl.parent = parent.clone();
+                    decl.type_name = field_type.clone();
 
                     result.declarations.push(decl);
                 }
@@ -549,6 +553,39 @@ impl JavaParser {
         }
 
         Ok(())
+    }
+
+    /// Extract the type from a field declaration (e.g., "private String name" -> "String")
+    fn extract_field_type(&self, node: Node, source: &str) -> Option<String> {
+        // In Java's tree-sitter grammar, the type is a direct child of field_declaration
+        // before the variable_declarator(s)
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                // Simple type: String, Integer, etc.
+                "type_identifier" => {
+                    return Some(node_text(child, source).to_string());
+                }
+                // Generic type: List<String>, Map<K, V>
+                "generic_type" => {
+                    return Some(node_text(child, source).to_string());
+                }
+                // Array type: String[], int[]
+                "array_type" => {
+                    return Some(node_text(child, source).to_string());
+                }
+                // Primitive types: int, boolean, etc.
+                "integral_type" | "floating_point_type" | "boolean_type" | "void_type" => {
+                    return Some(node_text(child, source).to_string());
+                }
+                // Scoped type: com.example.MyClass
+                "scoped_type_identifier" => {
+                    return Some(node_text(child, source).to_string());
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     fn extract_parameters(
@@ -621,6 +658,11 @@ impl JavaParser {
                                 current.start_byte(),
                                 current.end_byte(),
                             );
+
+                            // Debug: log when we add the reference
+                            if name == "calculateEndTranslation" || name == "getZoomContainerDistanceFromRecyclerViewCenter" {
+                                debug!("  -> Added as reference with kind {:?}", kind);
+                            }
 
                             result.references.push(UnresolvedReference {
                                 name,
@@ -761,14 +803,115 @@ impl JavaParser {
 
     fn determine_reference_kind(&self, parent: Node) -> Option<ReferenceKind> {
         match parent.kind() {
+            // Method/function calls
             "method_invocation" => Some(ReferenceKind::Call),
+            "explicit_constructor_invocation" => Some(ReferenceKind::Call),
+
+            // Field/property access
             "field_access" => Some(ReferenceKind::Read),
-            "assignment_expression" => Some(ReferenceKind::Write),
-            "type_identifier" | "generic_type" => Some(ReferenceKind::Type),
-            "superclass" | "super_interfaces" => Some(ReferenceKind::Inheritance),
+
+            // Assignment - identifiers on the right side are reads
+            // The left side (target) handling is separate
+            "assignment_expression" => Some(ReferenceKind::Read),
+
+            // Type references
+            "type_identifier" | "generic_type" | "type_arguments" => Some(ReferenceKind::Type),
+
+            // Inheritance
+            "superclass" | "super_interfaces" | "extends_interfaces" => {
+                Some(ReferenceKind::Inheritance)
+            }
+
+            // Object instantiation
             "object_creation_expression" => Some(ReferenceKind::Instantiation),
-            "annotation" | "marker_annotation" => Some(ReferenceKind::Annotation),
-            "cast_expression" => Some(ReferenceKind::Cast),
+
+            // Annotations
+            "annotation" | "marker_annotation" | "annotation_argument_list" => {
+                Some(ReferenceKind::Annotation)
+            }
+
+            // Cast expression
+            "cast_expression" => Some(ReferenceKind::Read),
+
+            // Binary expressions (arithmetic, comparison, logical)
+            "binary_expression" => Some(ReferenceKind::Read),
+
+            // Unary expressions (!, -, +, ++, --, ~)
+            "unary_expression" | "update_expression" => Some(ReferenceKind::Read),
+
+            // Ternary/conditional expression (condition ? a : b)
+            "ternary_expression" | "conditional_expression" => Some(ReferenceKind::Read),
+
+            // Parenthesized expressions
+            "parenthesized_expression" => Some(ReferenceKind::Read),
+
+            // Return statements
+            "return_statement" => Some(ReferenceKind::Read),
+
+            // Method arguments
+            "argument_list" => Some(ReferenceKind::Read),
+
+            // Array access (array[index])
+            "array_access" => Some(ReferenceKind::Read),
+
+            // Array creation
+            "array_creation_expression" | "array_initializer" => Some(ReferenceKind::Read),
+
+            // Variable declarations and initializers
+            "variable_declarator" | "local_variable_declaration" => Some(ReferenceKind::Read),
+
+            // Control flow statements - conditions and bodies
+            "if_statement" | "while_statement" | "do_statement" | "for_statement"
+            | "enhanced_for_statement" => Some(ReferenceKind::Read),
+
+            // Switch statements
+            "switch_expression" | "switch_statement" | "switch_block" | "switch_label"
+            | "switch_rule" | "switch_block_statement_group" => Some(ReferenceKind::Read),
+
+            // Exception handling
+            "throw_statement" | "catch_clause" | "try_statement" | "try_with_resources_statement" => {
+                Some(ReferenceKind::Read)
+            }
+
+            // Assert statement
+            "assert_statement" => Some(ReferenceKind::Read),
+
+            // Synchronized statement
+            "synchronized_statement" => Some(ReferenceKind::Read),
+
+            // Lambda expressions
+            "lambda_expression" | "lambda_body" => Some(ReferenceKind::Read),
+
+            // Expression statements (standalone expressions)
+            "expression_statement" => Some(ReferenceKind::Read),
+
+            // Instanceof check
+            "instanceof_expression" => Some(ReferenceKind::Read),
+
+            // Class literal (SomeClass.class)
+            "class_literal" => Some(ReferenceKind::Type),
+
+            // Method reference (SomeClass::method)
+            "method_reference" => Some(ReferenceKind::Read),
+
+            // String concatenation and templates
+            "string_literal" | "template_expression" => Some(ReferenceKind::Read),
+
+            // Block statements (code blocks)
+            "block" => Some(ReferenceKind::Read),
+
+            // Dimensions for array types
+            "dimensions_expr" => Some(ReferenceKind::Read),
+
+            // Resource in try-with-resources
+            "resource" | "resource_specification" => Some(ReferenceKind::Read),
+
+            // Spread in varargs or method references
+            "spread_element" => Some(ReferenceKind::Read),
+
+            // For loop parts
+            "for_init" | "for_condition" | "for_update" => Some(ReferenceKind::Read),
+
             _ => None,
         }
     }

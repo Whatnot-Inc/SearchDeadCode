@@ -75,9 +75,12 @@ impl GlobalMutableStateDetector {
         // We check if the property has "var" in modifiers or doesn't have "val"
         let has_val = decl.modifiers.iter().any(|m| m == "val");
         let has_const = decl.modifiers.iter().any(|m| m == "const");
+        let has_private_set = decl.modifiers.iter().any(|m| m == "private_set");
 
-        // If it has val or const, it's immutable
-        !has_val && !has_const
+        // If it has val, const, or private setter, it's not publicly mutable
+        // Private setter means the getter is public but the setter is private,
+        // so externally it's effectively read-only
+        !has_val && !has_const && !has_private_set
     }
 }
 
@@ -203,6 +206,10 @@ mod tests {
         // Const val (immutable)
         let const_val = create_property("MAX", 4, Visibility::Public, vec!["const"]);
         assert!(!detector.is_public_mutable_var(&const_val));
+
+        // Public var with private setter (effectively read-only externally)
+        let private_set_var = create_property("readOnly", 5, Visibility::Public, vec!["private_set"]);
+        assert!(!detector.is_public_mutable_var(&private_set_var), "var with private set should not be flagged");
     }
 
     #[test]

@@ -222,6 +222,9 @@ pub struct Declaration {
 
     /// Language (Kotlin or Java)
     pub language: Language,
+
+    /// Type name for properties/fields (e.g., "String", "RecyclerView", "MutableStateFlow<User>")
+    pub type_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +255,7 @@ impl Declaration {
             super_types: Vec::new(),
             modifiers: Vec::new(),
             language,
+            type_name: None,
         }
     }
 
@@ -272,6 +276,12 @@ impl Declaration {
             "Application",
             "ViewModel",
             "AndroidViewModel",
+            // Views are entry points because they can be instantiated from XML via reflection
+            "View",
+            "ViewGroup",
+            "SurfaceView",
+            "RecyclerView",
+            "Adapter",
         ];
 
         for super_type in &self.super_types {

@@ -640,7 +640,7 @@ fn run_analysis(config: &Config, cli: &Cli) -> Result<()> {
     let graph = if cli.parallel {
         // Parallel parsing mode
         if !cli.quiet {
-            println!(
+            eprintln!(
                 "{}",
                 format!("⚡ Parallel mode: parsing {} files...", files.len()).cyan()
             );
@@ -673,7 +673,7 @@ fn run_analysis(config: &Config, cli: &Cli) -> Result<()> {
 
     let parse_time = start_time.elapsed();
     if cli.parallel && !cli.quiet {
-        println!(
+        eprintln!(
             "{}",
             format!(
                 "⚡ Parsed {} files in {:.2}s",
@@ -722,7 +722,7 @@ fn run_analysis(config: &Config, cli: &Cli) -> Result<()> {
 
     let (dead_code, reachable) = if cli.deep {
         // Deep analysis mode - most aggressive
-        println!(
+        eprintln!(
             "{}",
             "🔬 Deep mode: aggressive dead code detection...".cyan()
         );
@@ -732,7 +732,7 @@ fn run_analysis(config: &Config, cli: &Cli) -> Result<()> {
         deep.analyze(&graph, &entry_points)
     } else if cli.enhanced && proguard_data.is_some() {
         // Enhanced mode with ProGuard cross-validation
-        println!(
+        eprintln!(
             "{}",
             "🔍 Enhanced mode: cross-validating with ProGuard data...".cyan()
         );

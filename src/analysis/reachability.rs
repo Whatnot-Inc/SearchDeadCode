@@ -179,6 +179,13 @@ impl ReachabilityAnalyzer {
             return true;
         }
 
+        // Skip parameters - let the dedicated UnusedParamDetector handle them
+        // The detector checks if parameters are actually used in their function body,
+        // which is more accurate than reachability-based detection
+        if decl.kind == DeclarationKind::Parameter {
+            return true;
+        }
+
         // Skip private/internal members of unreachable classes
         // (they should be reported at the class level, not individually)
         if let Some(parent_id) = &decl.parent {

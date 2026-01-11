@@ -552,6 +552,29 @@ impl KotlinParser {
                     decl.annotations = self.extract_annotations(node, source);
                     decl.parent = parent.clone();
 
+                    // Check for val/var keyword - in tree-sitter-kotlin grammar,
+                    // val/var is inside binding_pattern_kind which is a child of property_declaration
+                    let mut val_var_cursor = node.walk();
+                    for child in node.children(&mut val_var_cursor) {
+                        if child.kind() == "binding_pattern_kind" {
+                            let mut inner_cursor = child.walk();
+                            for inner_child in child.children(&mut inner_cursor) {
+                                match inner_child.kind() {
+                                    "val" => {
+                                        decl.modifiers.push("val".to_string());
+                                    }
+                                    "var" => {
+                                        decl.modifiers.push("var".to_string());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    // Extract property type (e.g., "val name: String" -> "String")
+                    decl.type_name = self.extract_property_type(node, source);
+
                     // Check for property delegation (by lazy, by Delegates, etc.)
                     if let Some(delegate_type) = self.extract_property_delegate(node, source) {
                         // Add delegation reference
@@ -564,6 +587,11 @@ impl KotlinParser {
                         });
                         // Mark property as delegated
                         decl.modifiers.push("delegated".to_string());
+                    }
+
+                    // Check for private setter (var with private set)
+                    if self.has_private_setter(node, source) {
+                        decl.modifiers.push("private_set".to_string());
                     }
 
                     result.declarations.push(decl);
@@ -622,6 +650,31 @@ impl KotlinParser {
                     if let Some(first) = text.split('.').next() {
                         return Some(first.to_string());
                     }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Extract the type of a property declaration (e.g., "val name: String" -> "String")
+    fn extract_property_type(&self, node: Node, source: &str) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                // Direct type reference: `val name: String`
+                "user_type" | "type_reference" => {
+                    return Some(node_text(child, source).to_string());
+                }
+                // Nullable type: `val name: String?`
+                "nullable_type" => {
+                    let type_text = node_text(child, source);
+                    // Include the ? for nullable types
+                    return Some(type_text.to_string());
+                }
+                // Function type: `val callback: () -> Unit`
+                "function_type" => {
+                    return Some(node_text(child, source).to_string());
                 }
                 _ => {}
             }
@@ -692,6 +745,37 @@ impl KotlinParser {
                 }
             }
         }
+    }
+
+    /// Check if a property has a private setter sibling.
+    /// In Kotlin, `var x: String = "" private set` makes the getter public but setter private.
+    fn has_private_setter(&self, node: Node, source: &str) -> bool {
+        // Check following siblings for a setter with private visibility
+        let mut next = node.next_sibling();
+        while let Some(sibling) = next {
+            match sibling.kind() {
+                "setter" => {
+                    // Check if the setter has a private visibility modifier
+                    let mut cursor = sibling.walk();
+                    for child in sibling.children(&mut cursor) {
+                        if child.kind() == "visibility_modifier" {
+                            let visibility_text = node_text(child, source);
+                            if visibility_text == "private" {
+                                return true;
+                            }
+                        }
+                    }
+                    // Only check the first setter we find
+                    return false;
+                }
+                "getter" => {
+                    // Continue looking, there might be a setter after the getter
+                    next = sibling.next_sibling();
+                }
+                _ => break,
+            }
+        }
+        false
     }
 
     /// Find the end byte of a property declaration, including any getter/setter siblings.
@@ -951,6 +1035,7 @@ impl KotlinParser {
         loop {
             let current = cursor.node();
 
+
             match current.kind() {
                 "simple_identifier" => {
                     // Determine reference kind based on parent context
@@ -1091,6 +1176,184 @@ impl KotlinParser {
 
                                     result.references.push(UnresolvedReference {
                                         name: method_name,
+                                        qualified_name: None,
+                                        kind: ReferenceKind::Call,
+                                        location,
+                                        imports: imports.to_vec(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // Workaround for tree-sitter-kotlin grammar bug:
+                // When a when condition contains `!isXxx()`, the grammar incorrectly
+                // parses `!is` as the "is not" type-check operator, resulting in:
+                // - type_test containing !is
+                // - ERROR node with the identifier (e.g., "Enabled" from "isEnabled")
+                // - function_type for the `() -> result` part
+                // We detect this pattern and extract the intended function call.
+                "type_test" => {
+                    let mut has_not_is = false;
+                    let mut error_identifier: Option<String> = None;
+                    let mut error_location: Option<(usize, usize, usize, usize)> = None;
+                    let mut has_function_type = false;
+
+                    let mut test_cursor = current.walk();
+                    for child in current.children(&mut test_cursor) {
+                        match child.kind() {
+                            "!is" => {
+                                has_not_is = true;
+                            }
+                            "ERROR" => {
+                                // Extract identifier from ERROR node
+                                let mut err_cursor = child.walk();
+                                for err_child in child.children(&mut err_cursor) {
+                                    if err_child.kind() == "simple_identifier" {
+                                        error_identifier = Some(node_text(err_child, source).to_string());
+                                        error_location = Some((
+                                            err_child.start_position().row,
+                                            err_child.start_position().column,
+                                            err_child.start_byte(),
+                                            err_child.end_byte(),
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                            "function_type" => {
+                                has_function_type = true;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // If we detected the bug pattern, extract the function call
+                    if has_not_is && error_identifier.is_some() && has_function_type {
+                        // Reconstruct the function name: "is" + error_identifier
+                        let ident = error_identifier.unwrap();
+                        let func_name = format!("is{}", ident);
+                        let (row, col, start, end) = error_location.unwrap();
+
+                        let location = point_to_location(
+                            path,
+                            tree_sitter::Point { row, column: col.saturating_sub(2) }, // Adjust for "is" prefix
+                            tree_sitter::Point { row, column: col + ident.len() },
+                            start.saturating_sub(2),
+                            end,
+                        );
+
+                        result.references.push(UnresolvedReference {
+                            name: func_name.clone(),
+                            qualified_name: None,
+                            kind: ReferenceKind::Call,
+                            location,
+                            imports: imports.to_vec(),
+                        });
+                    }
+
+                    // Also scan the entire type_test text for additional misparsed function calls
+                    // Since the parse error can cascade and absorb multiple when entries
+                    let type_test_text = node_text(current, source);
+                    let re_pattern = regex::Regex::new(r"([a-z][a-zA-Z0-9]*)\s*\(\s*\)").ok();
+                    if let Some(re) = re_pattern {
+                        for cap in re.captures_iter(type_test_text) {
+                            if let Some(m) = cap.get(1) {
+                                let func_name = m.as_str().to_string();
+                                // Skip keywords and already-handled isXxx patterns
+                                if func_name != "if" && func_name != "when" && func_name != "for"
+                                    && !func_name.starts_with("is") {
+                                    let offset = current.start_byte() + m.start();
+                                    let end = current.start_byte() + m.end();
+
+                                    let location = point_to_location(
+                                        path,
+                                        current.start_position(),
+                                        current.start_position(),
+                                        offset,
+                                        end,
+                                    );
+
+                                    result.references.push(UnresolvedReference {
+                                        name: func_name,
+                                        qualified_name: None,
+                                        kind: ReferenceKind::Call,
+                                        location,
+                                        imports: imports.to_vec(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // Also scan when_entry nodes that might have absorbed misparsed content
+                "when_entry" => {
+                    // Check if this when_entry has parse errors by looking for unusual content
+                    // (when entries with errors often contain multiple "-> " patterns)
+                    let entry_text = node_text(current, source);
+                    if entry_text.matches("->").count() > 1 {
+                        // This entry likely contains absorbed misparsed entries
+                        let re_pattern = regex::Regex::new(r"([a-z][a-zA-Z0-9]*)\s*\(\s*\)").ok();
+                        if let Some(re) = re_pattern {
+                            for cap in re.captures_iter(entry_text) {
+                                if let Some(m) = cap.get(1) {
+                                    let func_name = m.as_str().to_string();
+                                    // Skip keywords
+                                    if func_name != "if" && func_name != "when" && func_name != "for" {
+                                        let offset = current.start_byte() + m.start();
+                                        let end = current.start_byte() + m.end();
+
+                                        let location = point_to_location(
+                                            path,
+                                            current.start_position(),
+                                            current.start_position(),
+                                            offset,
+                                            end,
+                                        );
+
+                                        result.references.push(UnresolvedReference {
+                                            name: func_name,
+                                            qualified_name: None,
+                                            kind: ReferenceKind::Call,
+                                            location,
+                                            imports: imports.to_vec(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Workaround for tree-sitter-kotlin grammar bug (continued):
+                // After `!isXxx()` parse errors, the when conditions get misparsed.
+                // Look for ERROR nodes that contain identifiers followed by () in source.
+                "ERROR" => {
+                    // Check if this ERROR node is inside a when expression context
+                    // by looking for function-call-like patterns in the source text
+                    let error_text = node_text(current, source);
+
+                    // Look for patterns like "identifier()" in the error text
+                    // These are likely misparsed function calls
+                    let re_pattern = regex::Regex::new(r"([a-z][a-zA-Z0-9]*)\s*\(\s*\)").ok();
+                    if let Some(re) = re_pattern {
+                        for cap in re.captures_iter(error_text) {
+                            if let Some(m) = cap.get(1) {
+                                let func_name = m.as_str().to_string();
+                                // Skip common keywords
+                                if func_name != "if" && func_name != "when" && func_name != "for" {
+                                    let offset = current.start_byte() + m.start();
+                                    let end = current.start_byte() + m.end();
+
+                                    let location = point_to_location(
+                                        path,
+                                        current.start_position(),
+                                        current.start_position(),
+                                        offset,
+                                        end,
+                                    );
+
+                                    result.references.push(UnresolvedReference {
+                                        name: func_name,
                                         qualified_name: None,
                                         kind: ReferenceKind::Call,
                                         location,

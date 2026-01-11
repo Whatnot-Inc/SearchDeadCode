@@ -155,7 +155,13 @@ impl ParallelGraphBuilder {
     fn resolve_references(&self, graph: &mut Graph, unresolved: Vec<UnresolvedRef>) {
         for unresolved in unresolved {
             let resolved_ids = self.resolve_reference(graph, &unresolved);
+
             for to_id in resolved_ids {
+                // Skip self-references
+                if unresolved.from == to_id {
+                    continue;
+                }
+
                 let reference = Reference::new(
                     unresolved.kind,
                     Location::new(
