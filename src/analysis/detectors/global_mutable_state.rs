@@ -70,6 +70,11 @@ impl GlobalMutableStateDetector {
             return false;
         }
 
+        // Skip properties with @VisibleForTesting - they are public only for testing
+        if decl.annotations.iter().any(|a| a.contains("VisibleForTesting")) {
+            return false;
+        }
+
         // Check if it's a var (mutable) - we detect this through modifiers
         // In Kotlin, vars don't have a "val" modifier, vals do
         // We check if the property has "var" in modifiers or doesn't have "val"

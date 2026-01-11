@@ -3,8 +3,8 @@
 
 use super::common::{node_text, point_to_location, ParseResult, Parser};
 use crate::graph::{
-    Declaration, DeclarationId, DeclarationKind, Language, ReferenceKind, UnresolvedReference,
-    Visibility,
+    Declaration, DeclarationId, DeclarationKind, Language, Location, ReferenceKind,
+    UnresolvedReference, Visibility,
 };
 use miette::{IntoDiagnostic, Result};
 use std::path::Path;
@@ -123,6 +123,11 @@ impl KotlinParser {
                 }
                 "type_alias" => {
                     self.extract_type_alias(path, child, source, package, result)?;
+                }
+                // Skip class_body and related nodes - they are already handled by extract_class_members
+                // If we recurse into them, methods get extracted twice (once with parent, once without)
+                "class_body" | "enum_class_body" | "companion_object" => {
+                    // Don't recurse - already handled by extract_class/extract_object
                 }
                 _ => {
                     // Recurse into other nodes
@@ -2000,6 +2005,237 @@ impl KotlinParser {
             None => name.to_string(),
         }
     }
+
+    /// WORKAROUND for tree-sitter-kotlin grammar bug
+    ///
+    /// When certain syntax patterns occur (e.g., `else if` with function calls),
+    /// tree-sitter-kotlin may incorrectly end the class body early, causing
+    /// subsequent method declarations to be parsed as top-level functions.
+    ///
+    /// This function fixes orphaned declarations by:
+    /// 1. Finding all class/object declarations and their ACTUAL byte ranges (by scanning for matching braces)
+    /// 2. Finding orphaned functions (parent=None) that fall within those ranges
+    /// 3. Setting the correct parent and updating kind to Method
+    fn fix_orphaned_declarations(&self, source: &str, result: &mut ParseResult) {
+        // Collect class/object declarations - we'll compute actual end positions
+        let type_decls: Vec<(DeclarationId, usize)> = result
+            .declarations
+            .iter()
+            .filter(|d| d.kind.is_type() && d.parent.is_none())
+            .map(|d| (d.id.clone(), d.id.start))
+            .collect();
+
+        if type_decls.is_empty() {
+            return;
+        }
+
+        // Compute actual end positions by scanning for matching braces
+        let type_ranges: Vec<(DeclarationId, usize, usize)> = type_decls
+            .into_iter()
+            .filter_map(|(id, start)| {
+                let actual_end = self.find_matching_brace(source, start)?;
+                Some((id, start, actual_end))
+            })
+            .collect();
+
+        if type_ranges.is_empty() {
+            return;
+        }
+
+        // Find orphaned declarations and fix their parent
+        for decl in result.declarations.iter_mut() {
+            // Only fix top-level functions (not already class members)
+            if decl.parent.is_some() {
+                continue;
+            }
+
+            // Only fix functions, properties, and objects (not types themselves)
+            if decl.kind == DeclarationKind::Class
+                || decl.kind == DeclarationKind::Interface
+                || decl.kind == DeclarationKind::Enum
+                || decl.kind == DeclarationKind::Annotation
+            {
+                continue;
+            }
+
+            let decl_start = decl.id.start;
+            let decl_end = decl.id.end;
+
+            // Find the innermost containing type (smallest range that contains this declaration)
+            let containing_type = type_ranges
+                .iter()
+                .filter(|(_, start, end)| *start < decl_start && *end > decl_end)
+                .min_by_key(|(_, start, end)| end - start);
+
+            if let Some((type_id, _, _)) = containing_type {
+                // This declaration is inside a type but wasn't parsed as a member
+                decl.parent = Some(type_id.clone());
+
+                // Update kind: Function -> Method
+                if decl.kind == DeclarationKind::Function {
+                    decl.kind = DeclarationKind::Method;
+                }
+
+                // Clear FQN for methods (they don't have their own FQN)
+                decl.fully_qualified_name = None;
+
+                debug!(
+                    "Fixed orphaned {}: '{}' -> parent {:?}",
+                    decl.kind.display_name(),
+                    decl.name,
+                    type_id
+                );
+            }
+        }
+    }
+
+    /// WORKAROUND: Scan source text for function calls that tree-sitter may have missed
+    /// due to grammar bugs in certain contexts (e.g., else-if blocks).
+    fn scan_missed_function_calls(
+        &self,
+        path: &Path,
+        source: &str,
+        imports: &[String],
+        result: &mut ParseResult,
+    ) {
+        use std::collections::HashSet;
+
+        // Build a set of already-captured call references (by byte position)
+        let existing_calls: HashSet<usize> = result
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .map(|r| r.location.start_byte)
+            .collect();
+
+        // Regex to find simple function calls: identifier followed by (
+        // We use captures to extract just the identifier
+        let call_pattern = regex::Regex::new(
+            r"\b([a-z][a-zA-Z0-9_]*)\s*\("
+        ).ok();
+
+        let keywords: HashSet<&str> = [
+            "if", "when", "for", "while", "try", "catch", "finally", "return", "throw", "do",
+            "class", "fun", "val", "var", "object", "interface", "enum", "annotation",
+            "println", "print", "require", "check", "error", "assert", "apply", "also", "let", "run", "with"
+        ].iter().cloned().collect();
+
+        if let Some(re) = call_pattern {
+            for cap in re.captures_iter(source) {
+                if let Some(func_match) = cap.get(1) {
+                    let func_name = func_match.as_str();
+                    let match_start = func_match.start();
+
+                    // Skip if we already have a reference at this position
+                    if existing_calls.contains(&match_start) {
+                        continue;
+                    }
+
+                    // Skip Kotlin keywords and common functions
+                    if keywords.contains(func_name) {
+                        continue;
+                    }
+
+                    // Skip type constructors (PascalCase)
+                    if func_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(true) {
+                        continue;
+                    }
+
+                    // Create location
+                    let (line, col) = self.byte_to_line_col(source, match_start);
+                    let location = Location::new(
+                        path.to_path_buf(),
+                        line,
+                        col,
+                        match_start,
+                        match_start + func_name.len(),
+                    );
+
+                    result.references.push(UnresolvedReference {
+                        name: func_name.to_string(),
+                        qualified_name: None,
+                        kind: ReferenceKind::Call,
+                        location,
+                        imports: imports.to_vec(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Convert byte offset to line and column (1-indexed)
+    fn byte_to_line_col(&self, source: &str, byte_offset: usize) -> (usize, usize) {
+        let mut line = 1;
+        let mut col = 1;
+
+        for (i, ch) in source.bytes().enumerate() {
+            if i >= byte_offset {
+                break;
+            }
+            if ch == b'\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+
+        (line, col)
+    }
+
+    /// Find the matching closing brace for a class/object declaration
+    /// Returns the byte position of the closing brace, or None if not found
+    fn find_matching_brace(&self, source: &str, start_byte: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
+        let mut pos = start_byte;
+        let len = bytes.len();
+
+        // Find the opening brace
+        while pos < len && bytes[pos] != b'{' {
+            pos += 1;
+        }
+
+        if pos >= len {
+            return None;
+        }
+
+        // Skip the opening brace
+        pos += 1;
+        let mut depth = 1;
+        let mut in_string = false;
+        let mut in_char = false;
+        let mut prev_char = b'\0';
+
+        while pos < len && depth > 0 {
+            let ch = bytes[pos];
+
+            // Handle string literals
+            if ch == b'"' && prev_char != b'\\' && !in_char {
+                in_string = !in_string;
+            }
+            // Handle char literals
+            else if ch == b'\'' && prev_char != b'\\' && !in_string {
+                in_char = !in_char;
+            }
+            // Count braces only outside of strings/chars
+            else if !in_string && !in_char {
+                if ch == b'{' {
+                    depth += 1;
+                } else if ch == b'}' {
+                    depth -= 1;
+                }
+            }
+
+            prev_char = ch;
+            pos += 1;
+        }
+
+        if depth == 0 {
+            Some(pos)
+        } else {
+            None
+        }
+    }
 }
 
 impl Parser for KotlinParser {
@@ -2031,8 +2267,18 @@ impl Parser for KotlinParser {
         // Extract declarations
         temp_parser.extract_declarations(path, root, contents, &package, &mut result)?;
 
+        // WORKAROUND: tree-sitter-kotlin sometimes parses class members as top-level
+        // due to grammar bugs (e.g., when parsing else-if in certain contexts).
+        // Fix orphaned functions by checking if they fall within a class's byte range.
+        temp_parser.fix_orphaned_declarations(contents, &mut result);
+
         // Extract references
         temp_parser.extract_references(path, root, contents, &imports, &mut result)?;
+
+        // WORKAROUND: tree-sitter-kotlin may miss function calls in misparsed blocks
+        // (e.g., else-if blocks that get absorbed into weird AST structures).
+        // Scan the source text for function call patterns that weren't captured.
+        temp_parser.scan_missed_function_calls(path, contents, &imports, &mut result);
 
         debug!(
             "Parsed {}: {} declarations, {} references",
