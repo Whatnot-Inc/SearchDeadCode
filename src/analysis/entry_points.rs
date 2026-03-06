@@ -270,11 +270,26 @@ impl<'a> EntryPointDetector<'a> {
         let finder = FileFinder::new(self.config);
         let layouts = finder.find_layouts(root)?;
 
-        for layout in layouts {
+        let mut total_binding_vars = 0;
+        let mut total_method_refs = 0;
+
+        for layout in &layouts {
             let contents = layout.read_contents()?;
             let result = self.layout_parser.parse(&layout.path, &contents)?;
 
+            total_binding_vars += result.binding_variables.len();
+            total_method_refs += result.method_references.len();
+
             self.add_xml_references(graph, &result, entry_points);
+        }
+
+        if total_method_refs > 0 {
+            info!(
+                "Parsed {} layout files: {} binding variables, {} method references",
+                layouts.len(),
+                total_binding_vars,
+                total_method_refs
+            );
         }
 
         Ok(())
@@ -335,6 +350,7 @@ impl<'a> EntryPointDetector<'a> {
         result: &XmlParseResult,
         entry_points: &mut HashSet<DeclarationId>,
     ) {
+        // Handle class references
         for class_ref in &result.class_references {
             // Try to find by fully qualified name
             if let Some(decl) = graph.find_by_fqn(class_ref) {
@@ -350,6 +366,87 @@ impl<'a> EntryPointDetector<'a> {
                 debug!("XML entry point: {} (simple)", candidate.name);
                 entry_points.insert(candidate.id.clone());
             }
+        }
+
+        // Handle method references from data binding
+        if !result.method_references.is_empty() {
+            debug!(
+                "Processing {} method references from data binding",
+                result.method_references.len()
+            );
+        }
+        for method_ref in &result.method_references {
+            debug!(
+                "Data binding method ref: {}.{}",
+                method_ref.class_fqn, method_ref.method_name
+            );
+            self.add_method_reference(graph, &method_ref.class_fqn, &method_ref.method_name, entry_points);
+        }
+    }
+
+    /// Add a method reference as an entry point
+    fn add_method_reference(
+        &self,
+        graph: &Graph,
+        class_fqn: &str,
+        method_name: &str,
+        entry_points: &mut HashSet<DeclarationId>,
+    ) {
+        // Find the class first
+        let class_decl = if let Some(decl) = graph.find_by_fqn(class_fqn) {
+            Some(decl)
+        } else {
+            // Try by simple name
+            let simple_name = class_fqn.split('.').next_back().unwrap_or(class_fqn);
+            graph.find_by_name(simple_name).into_iter().next()
+        };
+
+        if let Some(class) = class_decl {
+            // Find the method as a child of this class
+            let children = graph.get_children(&class.id);
+            for child in children {
+                if let Some(child_decl) = graph.get_declaration(child) {
+                    if child_decl.name == method_name {
+                        debug!(
+                            "Data binding entry point: {}.{} (method)",
+                            class.name, method_name
+                        );
+                        entry_points.insert(child.clone());
+                        return;
+                    }
+                }
+            }
+
+            // Also search by name in case of inheritance or extension functions
+            let method_candidates = graph.find_by_name(method_name);
+            for candidate in method_candidates {
+                // Check if this method's parent matches the class
+                if let Some(parent_id) = &candidate.parent {
+                    if parent_id == &class.id {
+                        debug!(
+                            "Data binding entry point: {}.{} (by parent)",
+                            class.name, method_name
+                        );
+                        entry_points.insert(candidate.id.clone());
+                        return;
+                    }
+                }
+            }
+
+            // Log at info level if we couldn't find the method
+            // Only log for methods that look like view model callbacks
+            if method_name.starts_with("on") && method_name.len() > 3 {
+                info!(
+                    "Data binding: could not find method {} in class {} (children: {})",
+                    method_name, class_fqn, children.len()
+                );
+            }
+        } else {
+            // Log at info level if we couldn't find the class
+            info!(
+                "Data binding: could not find class {} for method {}",
+                class_fqn, method_name
+            );
         }
     }
 
